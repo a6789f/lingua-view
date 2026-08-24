@@ -151,7 +151,7 @@ function Watch() {
             {src ? (
               <video
                 ref={videoRef}
-                src={src}
+                key={src}
                 controls
                 playsInline
                 onTimeUpdate={onTimeUpdate}
@@ -161,7 +161,10 @@ function Watch() {
                   lastPausedIdx.current = -1;
                 }}
                 className="max-h-[62vh] w-full bg-black"
-              />
+              >
+                {src.startsWith("/demo/") && <source src="/demo/demo-scene.webm" type="video/webm" />}
+                <source src={src} />
+              </video>
             ) : (
               <div className="flex h-64 items-center justify-center px-6 text-center text-sm text-muted-foreground">
                 The video file lives only in your browser for this prototype. Re-upload it from the home screen to watch
