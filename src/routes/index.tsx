@@ -1,10 +1,15 @@
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useServerFn } from "@tanstack/react-start";
 import { UploadZone } from "@/components/UploadZone";
-import { ProcessingScreen, PROCESSING_STAGES } from "@/components/ProcessingScreen";
+import { ProcessingScreen } from "@/components/ProcessingScreen";
 import { VocabularyPanel } from "@/components/VocabularyPanel";
-import { extractWavFromVideo } from "@/lib/audio";
+import {
+  AudioExtractionError,
+  MAX_FILE_BYTES,
+  RECOMMENDED_DURATION_SEC,
+  extractWavChunks,
+} from "@/lib/audio";
 import { translateSentences } from "@/lib/xray.functions";
 import {
   createVideo,
@@ -36,22 +41,32 @@ export const Route = createFileRoute("/")({
 });
 
 interface RawSegment {
-  speaker: string;
+  speaker: string | null;
   text: string;
   start: number;
   end: number;
 }
+
+const SOURCE_OPTIONS = [{ code: "auto", label: "Auto detect" }, ...LANGUAGES];
+const TARGET_OPTIONS = [
+  { code: "ar", label: "Arabic" },
+  { code: "en", label: "English" },
+  { code: "ru", label: "Russian" },
+  ...LANGUAGES.filter((l) => !["ar", "en", "ru"].includes(l.code)),
+];
 
 function Home() {
   const navigate = useNavigate();
   const translate = useServerFn(translateSentences);
 
   const [sourceLang, setSourceLang] = useState("ru");
-  const [targetLang, setTargetLang] = useState("en");
+  const [targetLang, setTargetLang] = useState("ar");
   const [stage, setStage] = useState<number | null>(null);
+  const [detail, setDetail] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [videos, setVideos] = useState<VideoRow[]>([]);
   const [showVocab, setShowVocab] = useState(false);
+  const lastFile = useRef<File | null>(null);
 
   useEffect(() => {
     listVideos()
@@ -60,44 +75,93 @@ function Home() {
   }, []);
 
   async function process(file: File) {
+    lastFile.current = file;
     setError(null);
+    setDetail(null);
     setStage(0);
+    let objectUrl: string | null = null;
     try {
-      // 1. Analyzing video — read metadata.
-      const objectUrl = URL.createObjectURL(file);
+      // 1. Preparing video — validate and read metadata.
+      if (file.size > MAX_FILE_BYTES) {
+        throw new Error(
+          `This file is ${(file.size / 1024 / 1024).toFixed(0)} MB. Please use a short clip (under ${
+            MAX_FILE_BYTES / 1024 / 1024
+          } MB) for this prototype.`,
+        );
+      }
+      objectUrl = URL.createObjectURL(file);
       const duration = await readDuration(objectUrl);
+      if (duration && duration > RECOMMENDED_DURATION_SEC) {
+        setDetail(`${Math.round(duration / 60)} min clip — this may take a while`);
+      }
 
       // 2. Extracting audio locally (only audio leaves the browser).
       setStage(1);
-      const wav = await extractWavFromVideo(file);
+      const chunks = await extractWavChunks(file);
 
-      // 3-5. Transcription, speaker detection and segmentation.
-      setStage(2);
-      const form = new FormData();
-      form.append("audio", wav, "audio.wav");
-      form.append("sourceLang", langLabel(sourceLang));
-      const res = await fetch("/api/analyze", { method: "POST", body: form });
-      const payload = (await res.json()) as { segments?: RawSegment[]; error?: string };
-      if (!res.ok) throw new Error(payload.error ?? "Transcription failed");
-      const segments = payload.segments ?? [];
-      if (segments.length === 0) throw new Error("No dialogue was detected in this video's audio.");
-      setStage(4);
+      // 3-5. Upload each chunk, transcribe it and align real timestamps.
+      const sourceLabel = sourceLang === "auto" ? "" : langLabel(sourceLang);
+      const segments: RawSegment[] = [];
+      let detectedLanguage = "";
+      for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i]!;
+        setStage(2);
+        setDetail(`part ${i + 1} of ${chunks.length}`);
+        const form = new FormData();
+        form.append("audio", chunk.blob, `chunk-${i}.wav`);
+        form.append("sourceLang", sourceLabel);
+        form.append("langCode", sourceLang);
+        form.append("offset", String(chunk.offset));
+        form.append("duration", String(chunk.duration));
 
-      // 6. Translating.
+        setStage(3);
+        let res: Response;
+        try {
+          res = await fetch("/api/analyze", { method: "POST", body: form });
+        } catch (netErr) {
+          throw new Error(
+            `Network failure while uploading audio part ${i + 1} (${
+              netErr instanceof Error ? netErr.message : "connection lost"
+            }). Check your connection and retry.`,
+          );
+        }
+        let payload: { segments?: RawSegment[]; error?: string; language?: string };
+        try {
+          payload = (await res.json()) as typeof payload;
+        } catch {
+          throw new Error(`The transcription service returned an unreadable response (HTTP ${res.status}).`);
+        }
+        if (!res.ok) throw new Error(payload.error ?? `Transcription failed (HTTP ${res.status}).`);
+        setStage(4);
+        if (payload.language && !detectedLanguage) detectedLanguage = payload.language;
+        segments.push(...(payload.segments ?? []));
+      }
+
+      setDetail(null);
+      if (segments.length === 0) {
+        throw new Error("No speech was detected in this video's audio track.");
+      }
+
+      // 6. Translating the real transcript (text only — never the video).
       setStage(5);
       const { translations } = await translate({
         data: {
           sentences: segments.map((s) => s.text),
-          sourceLang: langLabel(sourceLang),
+          sourceLang: sourceLabel || detectedLanguage || "the detected language",
           targetLang: langLabel(targetLang),
         },
       });
 
       // 7. Persist and prepare the X-Ray layer.
       setStage(6);
+      const resolvedSource =
+        sourceLang !== "auto"
+          ? sourceLang
+          : (LANGUAGES.find((l) => l.label.toLowerCase() === detectedLanguage.trim().toLowerCase())?.code ??
+            sourceLang);
       const video = await createVideo({
         title: file.name.replace(/\.[^.]+$/, ""),
-        original_lang: sourceLang,
+        original_lang: resolvedSource === "auto" ? (detectedLanguage || "auto") : resolvedSource,
         translation_lang: targetLang,
         duration_sec: duration,
       });
@@ -105,7 +169,7 @@ function Home() {
         video.id,
         segments.map((s, i) => ({
           idx: i,
-          speaker: s.speaker,
+          speaker: s.speaker ?? "",
           text: s.text,
           translation: translations[i] ?? "",
           start_sec: s.start,
@@ -115,7 +179,15 @@ function Home() {
       rememberLocalVideo(video.id, objectUrl);
       navigate({ to: "/watch/$videoId", params: { videoId: video.id } });
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Processing failed");
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+      setDetail(null);
+      setError(
+        e instanceof AudioExtractionError
+          ? e.message
+          : e instanceof Error
+            ? e.message
+            : "Processing failed for an unknown reason.",
+      );
     }
   }
 
@@ -147,23 +219,42 @@ function Home() {
           <div className="mt-12">
             <ProcessingScreen
               current={stage}
+              detail={detail}
               error={error}
+              onRetry={() => {
+                const f = lastFile.current;
+                if (f) void process(f);
+              }}
               onCancel={() => {
                 setStage(null);
                 setError(null);
+                setDetail(null);
               }}
             />
           </div>
         ) : (
           <>
             <div className="mt-10 grid gap-3 sm:grid-cols-2">
-              <LangSelect label="Original / learning language" value={sourceLang} onChange={setSourceLang} />
-              <LangSelect label="Translation language" value={targetLang} onChange={setTargetLang} />
+              <LangSelect
+                label="Original / learning language"
+                value={sourceLang}
+                onChange={setSourceLang}
+                options={SOURCE_OPTIONS}
+              />
+              <LangSelect
+                label="Translation language"
+                value={targetLang}
+                onChange={setTargetLang}
+                options={TARGET_OPTIONS}
+              />
             </div>
 
             <div className="mt-6">
               <UploadZone onFile={process} />
             </div>
+            <p className="mt-3 text-center text-xs text-muted-foreground">
+              Prototype limit: clips up to ~{RECOMMENDED_DURATION_SEC / 60} minutes work best.
+            </p>
             {error && <p className="mt-3 text-sm text-destructive">{error}</p>}
           </>
         )}
@@ -188,9 +279,20 @@ function Home() {
                     params={{ videoId: v.id }}
                     className="flex items-center justify-between rounded-xl border border-border bg-surface px-4 py-3 transition-colors hover:bg-surface-elevated"
                   >
-                    <span className="truncate text-sm">{v.title}</span>
+                    <span className="flex min-w-0 items-center gap-2">
+                      <span
+                        className={[
+                          "shrink-0 rounded-md border px-1.5 py-0.5 text-[10px] uppercase tracking-wider",
+                          v.is_demo
+                            ? "border-border text-muted-foreground"
+                            : "border-xray/40 text-xray",
+                        ].join(" ")}
+                      >
+                        {v.is_demo ? "Demo" : "Upload"}
+                      </span>
+                      <span className="truncate text-sm">{v.title}</span>
+                    </span>
                     <span className="ml-4 shrink-0 text-xs text-muted-foreground">
-                      {v.is_demo ? "Demo · " : ""}
                       {langLabel(v.original_lang)} → {langLabel(v.translation_lang)}
                     </span>
                   </Link>
@@ -208,10 +310,12 @@ function LangSelect({
   label,
   value,
   onChange,
+  options,
 }: {
   label: string;
   value: string;
   onChange: (v: string) => void;
+  options: ReadonlyArray<{ code: string; label: string }>;
 }) {
   return (
     <label className="block">
@@ -221,7 +325,7 @@ function LangSelect({
         onChange={(e) => onChange(e.target.value)}
         className="mt-2 w-full rounded-lg border border-input bg-surface px-3 py-2 text-sm outline-none focus:border-primary"
       >
-        {LANGUAGES.map((l) => (
+        {options.map((l) => (
           <option key={l.code} value={l.code}>
             {l.label}
           </option>
